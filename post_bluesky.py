@@ -1,9 +1,11 @@
 import csv
+import json
 import os
 import pickle
 import random
 import socket
 import time
+import urllib.request
 import uuid
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
@@ -53,6 +55,42 @@ def get_creds():
     if creds and creds.expired and creds.refresh_token:
         creds.refresh(Request())
     return creds
+
+
+def print_runner_ip_and_location():
+    """
+    Print the GitHub Actions runner's public IP and rough geolocation.
+
+    Purely informational — this helps confirm (e.g. when something looks
+    off, or you're cross-checking against Bluesky's own login-activity
+    page) which network/region a given run actually executed from. Best
+    effort only: if the lookup fails (rate limit, network hiccup, the
+    `ip-api.com` endpoint not being on the runner's allowlist, etc.) we log
+    a warning and keep going rather than fail the whole job over it.
+    """
+    try:
+        with urllib.request.urlopen("https://ip-api.com/json/", timeout=5) as resp:
+            data = json.loads(resp.read().decode())
+        ip = data.get("query", "unknown")
+        city = data.get("city", "unknown")
+        region = data.get("regionName", "unknown")
+        country = data.get("country", "unknown")
+        isp = data.get("isp", "unknown")
+        print(f"Runner public IP: {ip}")
+        print(f"Runner location: {city}, {region}, {country} (ISP: {isp})")
+    except Exception as e:
+        print(f"Warning: could not determine runner IP/location: {e}")
+
+
+def print_target_account(handle):
+    """
+    Print which Bluesky handle this run is about to post as.
+
+    Printed before login so it's the first thing visible in the job log —
+    useful when multiple workflows/accounts share this same script, so a
+    glance at the log immediately confirms which account is in play.
+    """
+    print(f"Target Bluesky account: {handle}")
 
 
 def load_hashtag_sets(filepath="hashtags.txt"):
@@ -329,6 +367,7 @@ def post_image_to_bluesky(client, image_name, local_path, tags, with_link):
 def post_to_bluesky(media_name, local_path, kind, with_link):
     handle = get_env("BSKY_HANDLE")
     app_pw = get_env("BSKY_APP_PW")
+    print_target_account(handle)
     client = Client()
     client.login(handle, app_pw)
 
@@ -412,9 +451,12 @@ def main():
     API error) doesn't kill the whole loop - it just gets logged and retried
     next cycle.
 
-    Note: the GitHub Actions workflow calls run_once() once per trigger
-    instead of using this loop; main() is kept for standalone/local runs.
+    The workflow restarts this job periodically (GitHub's 6-hour job hard
+    cap), so this loop doesn't need to run forever on its own — just until
+    GitHub kills it, at which point the next scheduled trigger spins up a
+    fresh run that picks up right where this leaves off.
     """
+    print_runner_ip_and_location()
     print(f"Starting loop. Posting every {LOOP_INTERVAL_SECONDS} seconds.")
     while True:
         cycle_start = time.time()
@@ -430,4 +472,4 @@ def main():
 
 
 if __name__ == "__main__":
-    run_once()
+    main()
