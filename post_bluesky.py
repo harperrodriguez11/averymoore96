@@ -6,6 +6,7 @@ import socket
 import time
 import uuid
 from googleapiclient.discovery import build
+from googleapiclient.http import MediaIoBaseDownload
 from google.auth.transport.requests import Request
 from atproto import Client
 from atproto_client.utils import TextBuilder
@@ -17,6 +18,15 @@ from atproto_client.utils import TextBuilder
 # workflow run, which is exactly the scope we want a claim to last for.
 RUN_TAG = os.getenv("GITHUB_RUN_ID") or f"{socket.gethostname()}-{uuid.uuid4().hex[:8]}"
 CLAIM_PREFIX = "CLAIMED_"
+
+# ── Content mix knobs ────────────────────────────────────────────────────
+# What fraction of posts should be images vs. videos. Must sum to 1.0.
+IMAGE_RATIO = 0.60
+VIDEO_RATIO = 0.40
+
+# Of ALL posts (image or video), what fraction should skip the caption/CTA
+# /link block entirely and just be raw media + hashtags.
+NO_LINK_RATIO = 0.20
 
 
 def get_env(name, required=True):
@@ -97,6 +107,20 @@ def pick_random_caption_and_cta(filepath="recipes_captions.csv"):
     return random.choice(rows)
 
 
+def pick_random_caption_only(filepath="recipes_captions.csv"):
+    """Pick just a random caption (no CTA), for no-link posts.
+
+    No-link posts still want *something* describing the media, but the CTA
+    line only makes sense paired with the link below it, so we drop the CTA
+    and reuse the caption half of the same CSV row.
+    """
+    rows = load_caption_rows(filepath)
+    if not rows:
+        return ""
+    caption, _cta = random.choice(rows)
+    return caption
+
+
 def claim_file(service, file_id, current_name):
     """
     Try to "claim" a Drive file by renaming it with this run's unique tag.
@@ -124,55 +148,79 @@ def claim_file(service, file_id, current_name):
     return claimed_name
 
 
-def fetch_latest_video():
+def choose_media_kind():
+    """Randomly choose 'image' or 'video' for this run, per IMAGE_RATIO/VIDEO_RATIO."""
+    return random.choices(
+        population=["image", "video"],
+        weights=[IMAGE_RATIO, VIDEO_RATIO],
+        k=1,
+    )[0]
+
+
+def _download_file(service, file_id, local_path):
+    """Download a Drive file's bytes to local_path (handles large files via chunked download)."""
+    request = service.files().get_media(fileId=file_id)
+    with open(local_path, "wb") as f:
+        downloader = MediaIoBaseDownload(f, request)
+        done = False
+        while not done:
+            _status, done = downloader.next_chunk()
+
+
+def fetch_latest_media(preferred_kind):
+    """
+    Look through the upload folder for the newest unclaimed file whose
+    mimeType matches preferred_kind ('image' or 'video'). Files of the other
+    kind, and files already claimed by another concurrent run, are skipped
+    (left untouched) so a future run can pick them up.
+
+    Returns (file_dict, local_path, kind) or (None, None, None) if nothing
+    matching was found this cycle.
+    """
     creds = get_creds()
     service = build("drive", "v3", credentials=creds)
     folder_id = get_env("UPLOAD_FOLDER_ID")
     results = service.files().list(
         q=f"'{folder_id}' in parents",
         orderBy="createdTime desc",
-        pageSize=10
+        pageSize=25,
     ).execute()
     files = results.get("files", [])
     if not files:
         print("No files found in upload folder.")
-        return None, None
+        return None, None, None
+
+    prefix = f"{preferred_kind}/"  # "image/" or "video/"
 
     for file in files:
         mime_type = file.get("mimeType", "")
         original_name = file["name"]
 
-        # Skip files already claimed by another concurrent run (e.g. the
-        # other GitHub account's workflow grabbed it first and hasn't
-        # finished posting/moving it yet).
         if original_name.startswith(CLAIM_PREFIX):
             print(f"Skipping '{original_name}' — already claimed by another run.")
             continue
 
-        print(f"Found file: {original_name} ({mime_type})")
-        if not mime_type.startswith("video/"):
+        if not mime_type.startswith(prefix):
+            # Not the kind we're posting this run — leave it for later.
             continue
+
+        print(f"Found {preferred_kind}: {original_name} ({mime_type})")
 
         claimed_name = claim_file(service, file["id"], original_name)
         if claimed_name is None:
-            # Another run claimed it first; move on to the next candidate
-            # instead of giving up entirely for this cycle.
             continue
 
         print(f"Claimed '{original_name}' as '{claimed_name}'.")
-        request = service.files().get_media(fileId=file["id"])
         local_path = f"/tmp/{original_name}"
-        with open(local_path, "wb") as f:
-            f.write(request.execute())
+        _download_file(service, file["id"], local_path)
 
-        # Keep the original display name for the Bluesky alt text / logs,
-        # but remember the file's id and claimed name for the move step.
         file["claimed_name"] = claimed_name
         file["original_name"] = original_name
-        return file, local_path
+        file["mime_type"] = mime_type
+        return file, local_path, preferred_kind
 
-    print("No unclaimed video files found in upload folder.")
-    return None, None
+    print(f"No unclaimed {preferred_kind} files found in upload folder.")
+    return None, None, None
 
 
 def move_file(file_id, restore_name=None):
@@ -197,7 +245,7 @@ def move_file(file_id, restore_name=None):
 
 
 MAX_POST_LENGTH = 300  # Bluesky's grapheme limit per post
-LOOP_INTERVAL_SECONDS = 3712  # 60 minutes between cycles
+LOOP_INTERVAL_SECONDS = 4600  # 60 minutes between cycles (only used by main()'s loop mode)
 
 # ── Link definition ───────────────────────────────────────────────────────
 # Bluesky shows a "Leaving Bluesky" confirmation interstitial whenever the
@@ -205,37 +253,48 @@ LOOP_INTERVAL_SECONDS = 3712  # 60 minutes between cycles
 # To get a plain clickable link that opens directly with no warning, the
 # *displayed* text must be exactly the bare domain — same text Bluesky's own
 # UI would render for a link facet pointing at that domain.
-LINK_URL = "https://bnn.teentoday.cfd"
-LINK_DISPLAY_TEXT = "bnn.teentoday.cfd"
+LINK_URL = "https://foodieposts.com"
+LINK_DISPLAY_TEXT = "foodieposts.com"
 
 
-def build_post(tags: list[str]) -> TextBuilder:
+def build_post(tags: list[str], with_link: bool) -> TextBuilder:
     """
-    Final post layout:
+    Layout when with_link=True:
 
         Caption line
         \n
         <link_action_caption from the same CSV row>
-        bnn.teentoday.cfd   (clickable link, opens with no warning)
+        foodieposts.com   (clickable link, opens with no warning)
+        \n
+        #tag1 #tag2 #tag3 ...
+
+    Layout when with_link=False (no CTA, no link — just caption + tags):
+
+        Caption line
         \n
         #tag1 #tag2 #tag3 ...
     """
     tb = TextBuilder()
 
-    caption, cta = pick_random_caption_and_cta("recipes_captions.csv")
+    if with_link:
+        caption, cta = pick_random_caption_and_cta("recipes_captions.csv")
+    else:
+        caption, cta = pick_random_caption_only("recipes_captions.csv"), ""
+
     if caption:
         tb.text(caption)
         tb.text("\n\n")
 
-    # Plain-text CTA line (matched to the caption above from the same CSV
-    # row), then the clickable domain link on the line below it. Display
-    # text == bare domain == href domain, so Bluesky opens it directly
-    # instead of showing the leaving-site warning.
-    if cta:
-        tb.text(cta)
-        tb.text("\n")
-    tb.link(LINK_DISPLAY_TEXT, LINK_URL)
-    tb.text("\n\n")
+    if with_link:
+        # Plain-text CTA line (matched to the caption above from the same
+        # CSV row), then the clickable domain link on the line below it.
+        # Display text == bare domain == href domain, so Bluesky opens it
+        # directly instead of showing the leaving-site warning.
+        if cta:
+            tb.text(cta)
+            tb.text("\n")
+        tb.link(LINK_DISPLAY_TEXT, LINK_URL)
+        tb.text("\n\n")
 
     for i, tag in enumerate(tags):
         tb.tag(f"#{tag}", tag)
@@ -245,25 +304,44 @@ def build_post(tags: list[str]) -> TextBuilder:
     return tb
 
 
-def post_to_bluesky(video_name, local_path):
-    handle = get_env("BSKY_HANDLE")
-    app_pw = get_env("BSKY_APP_PW")
-    client = Client()
-    client.login(handle, app_pw)
-
+def post_video_to_bluesky(client, video_name, local_path, tags, with_link):
+    text_builder = build_post(tags, with_link)
     with open(local_path, "rb") as f:
         video_bytes = f.read()
-
-    tags = pick_random_hashtags("hashtags.txt")
-    text_builder = build_post(tags)
-
     client.send_video(
         text=text_builder,
         video=video_bytes,
         video_alt=video_name,
     )
-    print("Posted to Bluesky:")
-    print("  Link:", LINK_DISPLAY_TEXT)
+
+
+def post_image_to_bluesky(client, image_name, local_path, tags, with_link):
+    text_builder = build_post(tags, with_link)
+    with open(local_path, "rb") as f:
+        image_bytes = f.read()
+    client.send_image(
+        text=text_builder,
+        image=image_bytes,
+        image_alt=image_name,
+    )
+
+
+def post_to_bluesky(media_name, local_path, kind, with_link):
+    handle = get_env("BSKY_HANDLE")
+    app_pw = get_env("BSKY_APP_PW")
+    client = Client()
+    client.login(handle, app_pw)
+
+    tags = pick_random_hashtags("hashtags.txt")
+
+    if kind == "video":
+        post_video_to_bluesky(client, media_name, local_path, tags, with_link)
+    else:
+        post_image_to_bluesky(client, media_name, local_path, tags, with_link)
+
+    print(f"Posted {kind} to Bluesky (with_link={with_link}):")
+    if with_link:
+        print("  Link:", LINK_DISPLAY_TEXT)
     print("  Tags:", " ".join(f"#{t}" for t in tags))
 
 
@@ -272,7 +350,7 @@ def release_claim(file_id, original_name):
     Rename a claimed file back to its original name if something failed
     after claiming but before the move-to-processed step. Without this, a
     failed post would leave the file stuck with a CLAIMED_ prefix forever,
-    invisible to future fetch_latest_video() calls.
+    invisible to future fetch calls.
     """
     try:
         creds = get_creds()
@@ -284,15 +362,34 @@ def release_claim(file_id, original_name):
 
 
 def run_once():
-    """Run a single fetch -> post -> move cycle."""
-    file, local_path = fetch_latest_video()
+    """Run a single fetch -> post -> move cycle.
+
+    Each cycle independently rolls:
+      1. image vs video, per IMAGE_RATIO/VIDEO_RATIO
+      2. with-link vs no-link, per NO_LINK_RATIO
+
+    If the preferred media kind has no unclaimed files waiting, we fall back
+    to the other kind rather than skipping the whole cycle — so an empty
+    image folder doesn't stall posting when videos are available (and vice
+    versa).
+    """
+    preferred_kind = choose_media_kind()
+    fallback_kind = "video" if preferred_kind == "image" else "image"
+
+    file, local_path, kind = fetch_latest_media(preferred_kind)
     if not file:
-        print("No new video this cycle.")
+        print(f"No unclaimed {preferred_kind} available; trying fallback ({fallback_kind}).")
+        file, local_path, kind = fetch_latest_media(fallback_kind)
+
+    if not file:
+        print("No new media of either kind this cycle.")
         return
 
+    with_link = random.random() >= NO_LINK_RATIO  # NO_LINK_RATIO chance of False
     original_name = file.get("original_name", file["name"])
+
     try:
-        post_to_bluesky(original_name, local_path)
+        post_to_bluesky(original_name, local_path, kind, with_link)
     except Exception:
         # Posting failed (e.g. transient API error) — give the file back so
         # it's eligible to be picked up and retried next cycle, rather than
@@ -314,6 +411,9 @@ def main():
     Each cycle is wrapped in try/except so a single failure (e.g. a transient
     API error) doesn't kill the whole loop - it just gets logged and retried
     next cycle.
+
+    Note: the GitHub Actions workflow calls run_once() once per trigger
+    instead of using this loop; main() is kept for standalone/local runs.
     """
     print(f"Starting loop. Posting every {LOOP_INTERVAL_SECONDS} seconds.")
     while True:
@@ -330,4 +430,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    run_once()
