@@ -1,0 +1,48 @@
+name: Bluesky Auto Poster
+
+on:
+  schedule:
+    # Fires every 5h50m. With concurrency below, this acts as a restart
+    # trigger: if the previous run is still alive it's a no-op; if GitHub
+    # already killed the previous run at the 6-hour hard limit, this
+    # starts a fresh one. The script itself handles the 5-minute posting
+    # cadence internally via its own loop.
+    - cron: "0,50 */5 * * *"
+  workflow_dispatch: {}   # manual trigger from the Actions tab
+
+# Only one instance of the poster should ever be active at a time
+concurrency:
+  group: bluesky-poster
+  cancel-in-progress: false
+
+jobs:
+  post:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355   # just under GitHub's 360-minute hard cap per job
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v4
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install google-api-python-client google-auth-httplib2 google-auth-oauthlib atproto
+
+      - name: Verify token.pickle is present
+        run: |
+          if [ ! -s token.pickle ]; then
+            echo "::error::token.pickle not found in repo root (or it's empty). Make sure it's committed and not in .gitignore."
+            exit 1
+          fi
+          echo "token.pickle found ($(stat -c%s token.pickle) bytes)"
+
+      - name: Run poster loop
+        run: python -u post_bluesky.py
+        env:
+          PYTHONUNBUFFERED: "1"
+          BSKY_HANDLE: ${{ secrets.BSKY_HANDLE }}
+          BSKY_APP_PW: ${{ secrets.BSKY_APP_PW }}
+          UPLOAD_FOLDER_ID: ${{ secrets.UPLOAD_FOLDER_ID }}
+          PROCESSED_FOLDER_ID: ${{ secrets.PROCESSED_FOLDER_ID }}
