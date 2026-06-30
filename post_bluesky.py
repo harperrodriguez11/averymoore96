@@ -1,7 +1,6 @@
 import csv
 import json
 import os
-import pickle
 import random
 import socket
 import time
@@ -107,9 +106,28 @@ def print_config_summary():
 
 
 def get_creds():
-    """Load token.pickle from repo root, refreshing the access token if it has expired."""
-    with open("token.pickle", "rb") as token:
-        creds = pickle.load(token)
+    """
+    Build Google OAuth credentials from the GOOGLE_OAUTH_CREDENTIALS env var
+    instead of a token.pickle file on disk. The env var holds the standard
+    "authorized_user" JSON blob (token, refresh_token, client_id,
+    client_secret, scopes, ...) — the same shape you'd get from
+    google-auth's own credential storage, just passed in as a secret rather
+    than committed to the repo.
+
+    Refreshes the access token if it's expired (same as token.pickle did).
+    """
+    from google.oauth2.credentials import Credentials
+
+    raw = get_env("GOOGLE_OAUTH_CREDENTIALS")
+    try:
+        info = json.loads(raw)
+    except json.JSONDecodeError as e:
+        raise RuntimeError(
+            "GOOGLE_OAUTH_CREDENTIALS is not valid JSON. Make sure the whole "
+            "JSON blob (including the { } braces) was pasted into the secret."
+        ) from e
+
+    creds = Credentials.from_authorized_user_info(info)
     if creds and creds.expired and creds.refresh_token:
         creds.refresh(Request())
     return creds
@@ -187,11 +205,10 @@ FOLLOWER_SHEET_HEADER = ["Date (UTC)", "Handle", "Previous Followers", "Follower
 
 
 def get_sheets_service():
-    """Reuse the same token.pickle creds already used for Drive — no separate
-    Google credential needed, as long as the token's scopes include Sheets
-    (https://www.googleapis.com/auth/spreadsheets, or a broad 'drive' scope
-    that also covers Sheets). If you get a 403 here, the token.pickle needs
-    to be regenerated with the Sheets scope added."""
+    """Reuse the same OAuth creds (from GOOGLE_OAUTH_CREDENTIALS) already used
+    for Drive — no separate Google credential needed, as long as the token's
+    scopes cover Sheets. If you get a 403 here, the credential needs to be
+    re-authorized with Sheets access."""
     creds = get_creds()
     return build("sheets", "v4", credentials=creds)
 
@@ -292,46 +309,85 @@ def pick_random_hashtags(filepath="hashtags.txt"):
     return [word.lstrip("#") for word in chosen_line.split() if word.startswith("#")]
 
 
-def load_caption_rows(filepath="recipes_captions.csv"):
-    """Return a list of (caption, link_action_caption) tuples from the CSV.
+# ── Captions (Google Sheet) ──────────────────────────────────────────────
+# Captions + their matching CTA text now live in a Google Sheet instead of
+# recipes_captions.csv, so they can be edited without touching the repo.
+# Expected columns (header row, any order): "captions" and either
+# "link_action_caption" or the "lik_action_caption" typo variant — same
+# tolerant header matching the old CSV reader used.
+CAPTIONS_SHEET_ID = "1dkzjf2wX6AYyf5XH1w9mzdvOVcYy_X2boF1L8znHwME"
+CAPTIONS_SHEET_TAB = "Sheet1"
+CAPTIONS_SHEET_RANGE = f"{CAPTIONS_SHEET_TAB}!A:Z"
 
-    Each row pairs a caption with its own matching CTA text, so we keep
-    them together rather than picking each independently — that's what
-    keeps the CTA relevant to the caption it's paired with.
-    """
+_caption_rows_cache = None  # populated once per process run, then reused
+
+
+def load_caption_rows():
+    """Return a list of (caption, link_action_caption) tuples from the
+    captions Google Sheet. Cached after the first call so a long-running
+    loop (many post cycles per workflow run) doesn't re-fetch the sheet
+    every time a caption is needed."""
+    global _caption_rows_cache
+    if _caption_rows_cache is not None:
+        return _caption_rows_cache
+
+    service = get_sheets_service()
+    result = service.spreadsheets().values().get(
+        spreadsheetId=CAPTIONS_SHEET_ID, range=CAPTIONS_SHEET_RANGE
+    ).execute()
+    values = result.get("values", [])
+    if not values:
+        print("Warning: captions sheet is empty.")
+        _caption_rows_cache = []
+        return _caption_rows_cache
+
+    header = [h.strip().lower() for h in values[0]]
+
+    def col_index(*names):
+        for name in names:
+            if name in header:
+                return header.index(name)
+        return None
+
+    caption_idx = col_index("captions", "caption")
+    cta_idx = col_index("link_action_caption", "lik_action_caption")
+
+    if caption_idx is None or cta_idx is None:
+        print(
+            f"Warning: captions sheet header {header} is missing a 'captions' "
+            "and/or 'link_action_caption' column."
+        )
+        _caption_rows_cache = []
+        return _caption_rows_cache
+
     rows = []
-    with open(filepath, "r", encoding="utf-8", newline="") as f:
-        reader = csv.DictReader(f)
-        # Be tolerant of the "lik_action_caption" header typo in the source
-        # file, or a correctly spelled "link_action_caption" header.
-        for row in reader:
-            caption = (row.get("captions") or "").strip()
-            cta = (
-                row.get("link_action_caption")
-                or row.get("lik_action_caption")
-                or ""
-            ).strip()
-            if caption and cta:
-                rows.append((caption, cta))
-    return rows
+    for row in values[1:]:
+        caption = row[caption_idx].strip() if len(row) > caption_idx else ""
+        cta = row[cta_idx].strip() if len(row) > cta_idx else ""
+        if caption and cta:
+            rows.append((caption, cta))
+
+    print(f"Loaded {len(rows)} caption/CTA pairs from captions sheet.")
+    _caption_rows_cache = rows
+    return _caption_rows_cache
 
 
-def pick_random_caption_and_cta(filepath="recipes_captions.csv"):
+def pick_random_caption_and_cta():
     """Pick one random (caption, cta) pair; return ('', '') if none found."""
-    rows = load_caption_rows(filepath)
+    rows = load_caption_rows()
     if not rows:
         return "", ""
     return random.choice(rows)
 
 
-def pick_random_caption_only(filepath="recipes_captions.csv"):
+def pick_random_caption_only():
     """Pick just a random caption (no CTA), for no-link posts.
 
     No-link posts still want *something* describing the media, but the CTA
     line only makes sense paired with the link below it, so we drop the CTA
-    and reuse the caption half of the same CSV row.
+    and reuse the caption half of the same sheet row.
     """
-    rows = load_caption_rows(filepath)
+    rows = load_caption_rows()
     if not rows:
         return ""
     caption, _cta = random.choice(rows)
@@ -494,9 +550,9 @@ def build_post(tags: list[str], with_link: bool) -> TextBuilder:
     tb = TextBuilder()
 
     if with_link:
-        caption, cta = pick_random_caption_and_cta("recipes_captions.csv")
+        caption, cta = pick_random_caption_and_cta()
     else:
-        caption, cta = pick_random_caption_only("recipes_captions.csv"), ""
+        caption, cta = pick_random_caption_only(), ""
 
     if caption:
         tb.text(caption)
