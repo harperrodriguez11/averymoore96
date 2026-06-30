@@ -1,36 +1,43 @@
 name: Bluesky Auto Poster
 on:
   schedule:
-    # Fires every 5h50m. With concurrency below, this acts as a restart
-    # trigger: if the previous run is still alive it's a no-op; if GitHub
-    # already killed the previous run at the 6-hour hard limit, this
-    # starts a fresh one. The script itself handles the posting cadence
-    # internally via its own loop.
-    - cron: "0,50 */5 * * *"
+    # Runs every 6 hours = 4 times a day. Each job has a ~6h hard cap
+    # (timeout-minutes below), so this also acts as the restart trigger:
+    # by the time this fires again, the previous run has wrapped up (or
+    # been killed at the cap) and a fresh one starts right after. The
+    # script itself handles the actual posting cadence internally via its
+    # own loop, so this schedule just keeps that loop continuously alive.
+    - cron: "0 */6 * * *"
   workflow_dispatch:       # manual trigger from the Actions tab, with knobs
     inputs:
+      caption_sheet_name:
+        description: "Caption category / sheet tab to use (e.g. 'recipes', 'fitness'). Created automatically the first time a new name is used, then reused as-is from then on."
+        required: false
+        default: ""
       image_ratio:
         description: "Image post share (e.g. 60 or 0.6) — auto-normalized against video_ratio"
         required: false
-        default: "60"
+        default: ""
       video_ratio:
         description: "Video post share (e.g. 40 or 0.4) — auto-normalized against image_ratio"
         required: false
-        default: "40"
+        default: ""
       no_link_ratio:
         description: "Chance a post skips the caption/CTA/link block (e.g. 20 or 0.2)"
         required: false
-        default: "20"
+        default: ""
       hashtags_enabled_image:
         description: "Attach hashtags to image posts?"
         required: false
-        default: "true"
-        type: boolean
+        default: ""
+        type: choice
+        options: ["", "true", "false"]
       hashtags_enabled_video:
         description: "Attach hashtags to video posts?"
         required: false
-        default: "true"
-        type: boolean
+        default: ""
+        type: choice
+        options: ["", "true", "false"]
 
 # Only one instance of the poster should ever be active at a time
 concurrency:
@@ -57,13 +64,16 @@ jobs:
           GOOGLE_OAUTH_CREDENTIALS: ${{ secrets.GOOGLE_OAUTH_CREDENTIALS }}
           UPLOAD_FOLDER_ID: ${{ secrets.UPLOAD_FOLDER_ID }}
           PROCESSED_FOLDER_ID: ${{ secrets.PROCESSED_FOLDER_ID }}
-          # Content-mix knobs. workflow_dispatch inputs only exist when the
-          # run was triggered manually; on the scheduled trigger these are
-          # empty strings, and the script's own defaults (60/40/20, hashtags
-          # on) kick in. Override the defaults below if you want the
-          # *scheduled* runs to use different values too.
-          IMAGE_RATIO: ${{ github.event.inputs.image_ratio || '60' }}
-          VIDEO_RATIO: ${{ github.event.inputs.video_ratio || '40' }}
-          NO_LINK_RATIO: ${{ github.event.inputs.no_link_ratio || '20' }}
-          HASHTAGS_ENABLED_IMAGE: ${{ github.event.inputs.hashtags_enabled_image || 'true' }}
-          HASHTAGS_ENABLED_VIDEO: ${{ github.event.inputs.hashtags_enabled_video || 'true' }}
+          # ── Settings precedence: manual input > repo Variable > script default ──
+          # Setting these once as repo Variables (Settings → Secrets and
+          # variables → Actions → Variables) means BOTH the scheduled runs
+          # (4x/day, no inputs) and any manual run that doesn't override a
+          # field will keep using the same configured values automatically.
+          # Use workflow_dispatch inputs only when you want to override for
+          # one specific manual run.
+          CAPTION_SHEET_NAME: ${{ github.event.inputs.caption_sheet_name || vars.CAPTION_SHEET_NAME }}
+          IMAGE_RATIO: ${{ github.event.inputs.image_ratio || vars.IMAGE_RATIO || '60' }}
+          VIDEO_RATIO: ${{ github.event.inputs.video_ratio || vars.VIDEO_RATIO || '40' }}
+          NO_LINK_RATIO: ${{ github.event.inputs.no_link_ratio || vars.NO_LINK_RATIO || '20' }}
+          HASHTAGS_ENABLED_IMAGE: ${{ github.event.inputs.hashtags_enabled_image || vars.HASHTAGS_ENABLED_IMAGE || 'true' }}
+          HASHTAGS_ENABLED_VIDEO: ${{ github.event.inputs.hashtags_enabled_video || vars.HASHTAGS_ENABLED_VIDEO || 'true' }}
