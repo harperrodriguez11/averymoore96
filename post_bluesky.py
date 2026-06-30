@@ -4,7 +4,6 @@ import os
 import random
 import socket
 import time
-import urllib.request
 import uuid
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
@@ -102,6 +101,7 @@ def print_config_summary():
     print(f"  No-link rate: {NO_LINK_RATIO:.0%}")
     print(f"  Hashtags on image posts: {HASHTAGS_ENABLED_IMAGE}")
     print(f"  Hashtags on video posts: {HASHTAGS_ENABLED_VIDEO}")
+    print(f"  Caption category (sheet tab): {get_caption_sheet_tab_name()}")
     print("─────────────────────────────────────────────────")
 
 
@@ -131,50 +131,6 @@ def get_creds():
     if creds and creds.expired and creds.refresh_token:
         creds.refresh(Request())
     return creds
-
-
-def _try_ip_lookup(url, parse_fn, timeout=5):
-    req = urllib.request.Request(url, headers={"User-Agent": "curl/8.0"})
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        data = json.loads(resp.read().decode())
-    return parse_fn(data)
-
-
-def print_runner_ip_and_location():
-    """
-    Print the GitHub Actions runner's public IP and rough geolocation.
-
-    Purely informational — this helps confirm (e.g. when something looks
-    off, or you're cross-checking against Bluesky's own login-activity
-    page) which network/region a given run actually executed from.
-
-    GitHub-hosted runner IPs get hit by every workflow on the planet, so a
-    single free geo-IP service can start 403/429-ing them during busy
-    periods (this is what was happening with ip-api.com). We try a small
-    chain of independent services and use whichever answers first; if all
-    of them fail we log a warning and keep going rather than fail the whole
-    job over a "nice to know" detail.
-    """
-    providers = [
-        ("ipinfo.io", "https://ipinfo.io/json",
-         lambda d: (d.get("ip", "unknown"),
-                    f"{d.get('city', 'unknown')}, {d.get('region', 'unknown')}, {d.get('country', 'unknown')} (org: {d.get('org', 'unknown')})")),
-        ("ifconfig.co", "https://ifconfig.co/json",
-         lambda d: (d.get("ip", "unknown"),
-                    f"{d.get('city', 'unknown')}, {d.get('region_name', 'unknown')}, {d.get('country', 'unknown')} (ASN: {d.get('asn_org', 'unknown')})")),
-        ("ip-api.com", "https://ip-api.com/json/",
-         lambda d: (d.get("query", "unknown"),
-                    f"{d.get('city', 'unknown')}, {d.get('regionName', 'unknown')}, {d.get('country', 'unknown')} (ISP: {d.get('isp', 'unknown')})")),
-    ]
-    for name, url, parse_fn in providers:
-        try:
-            ip, location = _try_ip_lookup(url, parse_fn)
-            print(f"Runner public IP: {ip}  [via {name}]")
-            print(f"Runner location: {location}")
-            return
-        except Exception as e:
-            print(f"Note: IP lookup via {name} failed ({e}); trying next provider...")
-    print("Warning: could not determine runner IP/location from any provider.")
 
 
 def print_target_account(handle):
@@ -310,34 +266,72 @@ def pick_random_hashtags(filepath="hashtags.txt"):
 
 
 # ── Captions (Google Sheet) ──────────────────────────────────────────────
-# Captions + their matching CTA text now live in a Google Sheet instead of
+# Captions + their matching CTA text live in a Google Sheet instead of
 # recipes_captions.csv, so they can be edited without touching the repo.
-# Expected columns (header row, any order): "captions" and either
-# "link_action_caption" or the "lik_action_caption" typo variant — same
-# tolerant header matching the old CSV reader used.
+# Different caption categories live in different TABS of the same
+# spreadsheet (e.g. "recipes", "fitness", "travel"...) — set via the
+# CAPTION_SHEET_NAME env var. If a tab with that name doesn't exist yet, it
+# gets created automatically (with a header row) on first use; from then on
+# it's just reused as-is, so picking the same name again never re-creates it.
+# Expected columns in that tab's header row (any order): "captions" and
+# either "link_action_caption" or the "lik_action_caption" typo variant —
+# same tolerant header matching the old CSV reader used.
 CAPTIONS_SHEET_ID = "1dkzjf2wX6AYyf5XH1w9mzdvOVcYy_X2boF1L8znHwME"
-CAPTIONS_SHEET_TAB = "Sheet1"
-CAPTIONS_SHEET_RANGE = f"{CAPTIONS_SHEET_TAB}!A:Z"
+CAPTIONS_SHEET_HEADER = ["captions", "link_action_caption"]
 
 _caption_rows_cache = None  # populated once per process run, then reused
 
 
+def get_caption_sheet_tab_name():
+    """Name of the tab/category to use for captions this run, e.g. 'recipes'
+    or 'fitness'. Configurable via CAPTION_SHEET_NAME; falls back to a
+    generic default tab if not set."""
+    return get_env("CAPTION_SHEET_NAME", required=False) or "Sheet1"
+
+
+def ensure_caption_tab_exists(service, tab_name):
+    """Create the given tab (with a header row) in the captions spreadsheet
+    if it doesn't already exist. Once created, future runs that pass the
+    same CAPTION_SHEET_NAME just reuse it — this only ever creates a tab the
+    first time a given category name is used."""
+    metadata = service.spreadsheets().get(spreadsheetId=CAPTIONS_SHEET_ID).execute()
+    existing_titles = [s["properties"]["title"] for s in metadata.get("sheets", [])]
+    if tab_name in existing_titles:
+        return
+
+    print(f"Caption tab '{tab_name}' doesn't exist yet — creating it.")
+    service.spreadsheets().batchUpdate(
+        spreadsheetId=CAPTIONS_SHEET_ID,
+        body={"requests": [{"addSheet": {"properties": {"title": tab_name}}}]},
+    ).execute()
+    service.spreadsheets().values().update(
+        spreadsheetId=CAPTIONS_SHEET_ID,
+        range=f"{tab_name}!A1:B1",
+        valueInputOption="RAW",
+        body={"values": [CAPTIONS_SHEET_HEADER]},
+    ).execute()
+    print(f"Created caption tab '{tab_name}' with header row. Add your captions to it.")
+
+
 def load_caption_rows():
     """Return a list of (caption, link_action_caption) tuples from the
-    captions Google Sheet. Cached after the first call so a long-running
-    loop (many post cycles per workflow run) doesn't re-fetch the sheet
-    every time a caption is needed."""
+    active caption tab (CAPTION_SHEET_NAME). Cached after the first call so
+    a long-running loop (many post cycles per workflow run) doesn't re-fetch
+    the sheet every time a caption is needed."""
     global _caption_rows_cache
     if _caption_rows_cache is not None:
         return _caption_rows_cache
 
+    tab_name = get_caption_sheet_tab_name()
     service = get_sheets_service()
+    ensure_caption_tab_exists(service, tab_name)
+
     result = service.spreadsheets().values().get(
-        spreadsheetId=CAPTIONS_SHEET_ID, range=CAPTIONS_SHEET_RANGE
+        spreadsheetId=CAPTIONS_SHEET_ID, range=f"{tab_name}!A:Z"
     ).execute()
     values = result.get("values", [])
     if not values:
-        print("Warning: captions sheet is empty.")
+        print(f"Warning: caption tab '{tab_name}' is empty.")
         _caption_rows_cache = []
         return _caption_rows_cache
 
@@ -354,8 +348,8 @@ def load_caption_rows():
 
     if caption_idx is None or cta_idx is None:
         print(
-            f"Warning: captions sheet header {header} is missing a 'captions' "
-            "and/or 'link_action_caption' column."
+            f"Warning: caption tab '{tab_name}' header {header} is missing a "
+            "'captions' and/or 'link_action_caption' column."
         )
         _caption_rows_cache = []
         return _caption_rows_cache
@@ -367,7 +361,7 @@ def load_caption_rows():
         if caption and cta:
             rows.append((caption, cta))
 
-    print(f"Loaded {len(rows)} caption/CTA pairs from captions sheet.")
+    print(f"Loaded {len(rows)} caption/CTA pairs from caption tab '{tab_name}'.")
     _caption_rows_cache = rows
     return _caption_rows_cache
 
@@ -702,7 +696,6 @@ def main():
     GitHub kills it, at which point the next scheduled trigger spins up a
     fresh run that picks up right where this leaves off.
     """
-    print_runner_ip_and_location()
     print_config_summary()
     print(f"Starting loop. Posting every {LOOP_INTERVAL_SECONDS} seconds.")
     while True:
