@@ -21,15 +21,6 @@ from atproto_client.utils import TextBuilder
 RUN_TAG = os.getenv("GITHUB_RUN_ID") or f"{socket.gethostname()}-{uuid.uuid4().hex[:8]}"
 CLAIM_PREFIX = "CLAIMED_"
 
-# ── Content mix knobs ────────────────────────────────────────────────────
-# What fraction of posts should be images vs. videos. Must sum to 1.0.
-IMAGE_RATIO = 0.60
-VIDEO_RATIO = 0.40
-
-# Of ALL posts (image or video), what fraction should skip the caption/CTA
-# /link block entirely and just be raw media + hashtags.
-NO_LINK_RATIO = 0.20
-
 
 def get_env(name, required=True):
     """Read an env var and strip surrounding whitespace/newlines.
@@ -46,6 +37,73 @@ def get_env(name, required=True):
             raise RuntimeError(f"Missing required environment variable: {name}")
         return ""
     return value.strip()
+
+
+def get_float_env(name, default):
+    """Read a float env var (e.g. a ratio/percentage knob), falling back to default.
+
+    Accepts either a plain fraction ("0.6") or a percentage ("60" / "60%") so
+    the GitHub Actions workflow input field is forgiving about format.
+    """
+    raw = os.getenv(name)
+    if raw is None or raw.strip() == "":
+        return default
+    raw = raw.strip().rstrip("%")
+    try:
+        value = float(raw)
+    except ValueError:
+        print(f"Warning: could not parse {name}='{raw}' as a number; using default {default}.")
+        return default
+    # If it looks like a percentage (>1), normalize to a 0..1 fraction.
+    if value > 1:
+        value = value / 100.0
+    return value
+
+
+def get_bool_env(name, default=True):
+    """Read a boolean env var ('true'/'false', '1'/'0', 'yes'/'on'), case-insensitive."""
+    raw = os.getenv(name)
+    if raw is None or raw.strip() == "":
+        return default
+    return raw.strip().lower() in ("1", "true", "yes", "on")
+
+
+# ── Content mix knobs ────────────────────────────────────────────────────
+# What fraction of posts should be images vs. videos. Configurable via the
+# IMAGE_RATIO / VIDEO_RATIO env vars (plain fraction like "0.6" or a
+# percentage like "60"/"60%"). Whatever values are given get auto-normalized
+# to sum to 1.0, so you don't have to do the math by hand when tweaking the
+# workflow_dispatch inputs — e.g. IMAGE_RATIO=70, VIDEO_RATIO=30 just works.
+_raw_image_ratio = get_float_env("IMAGE_RATIO", 0.60)
+_raw_video_ratio = get_float_env("VIDEO_RATIO", 0.40)
+_ratio_sum = _raw_image_ratio + _raw_video_ratio
+if _ratio_sum <= 0:
+    IMAGE_RATIO, VIDEO_RATIO = 0.60, 0.40
+else:
+    IMAGE_RATIO = _raw_image_ratio / _ratio_sum
+    VIDEO_RATIO = _raw_video_ratio / _ratio_sum
+
+# Of ALL posts (image or video), what fraction should skip the caption/CTA
+# /link block entirely and just be raw media + hashtags. Configurable via
+# NO_LINK_RATIO (plain fraction or percentage, e.g. "20" or "0.2").
+NO_LINK_RATIO = get_float_env("NO_LINK_RATIO", 0.20)
+
+# Whether to attach hashtags at all, broken out per media kind so e.g. video
+# posts can carry hashtags while image posts don't (or vice versa).
+HASHTAGS_ENABLED_IMAGE = get_bool_env("HASHTAGS_ENABLED_IMAGE", True)
+HASHTAGS_ENABLED_VIDEO = get_bool_env("HASHTAGS_ENABLED_VIDEO", True)
+
+
+def print_config_summary():
+    """Log the active content-mix knobs at startup so a glance at the job
+    log confirms what this run is actually configured to do."""
+    print("── Content mix config ──────────────────────────")
+    print(f"  Image ratio:  {IMAGE_RATIO:.0%}")
+    print(f"  Video ratio:  {VIDEO_RATIO:.0%}")
+    print(f"  No-link rate: {NO_LINK_RATIO:.0%}")
+    print(f"  Hashtags on image posts: {HASHTAGS_ENABLED_IMAGE}")
+    print(f"  Hashtags on video posts: {HASHTAGS_ENABLED_VIDEO}")
+    print("─────────────────────────────────────────────────")
 
 
 def get_creds():
@@ -84,13 +142,14 @@ def print_runner_ip_and_location():
 
 def print_target_account(handle):
     """
-    Print which Bluesky handle this run is about to post as.
-
-    Printed before login so it's the first thing visible in the job log —
-    useful when multiple workflows/accounts share this same script, so a
-    glance at the log immediately confirms which account is in play.
+    Print which Bluesky handle this run is about to post as, in @handle form
+    so it's unambiguous at a glance (e.g. "@myaccount.bsky.social") which
+    account is in play. Printed before login so it's the first thing visible
+    in the job log — useful when multiple workflows/accounts share this same
+    script.
     """
-    print(f"Target Bluesky account: {handle}")
+    display_handle = handle if handle.startswith("@") else f"@{handle}"
+    print(f"Target Bluesky account: {display_handle}")
 
 
 def load_hashtag_sets(filepath="hashtags.txt"):
@@ -283,7 +342,7 @@ def move_file(file_id, restore_name=None):
 
 
 MAX_POST_LENGTH = 300  # Bluesky's grapheme limit per post
-LOOP_INTERVAL_SECONDS = 3900  # 60 minutes between cycles (only used by main()'s loop mode)
+LOOP_INTERVAL_SECONDS = 3900  # 65 minutes between cycles (only used by main()'s loop mode)
 
 # ── Link definition ───────────────────────────────────────────────────────
 # Bluesky shows a "Leaving Bluesky" confirmation interstitial whenever the
@@ -304,13 +363,13 @@ def build_post(tags: list[str], with_link: bool) -> TextBuilder:
         <link_action_caption from the same CSV row>
         foodieposts.com   (clickable link, opens with no warning)
         \n
-        #tag1 #tag2 #tag3 ...
+        #tag1 #tag2 #tag3 ...   (omitted entirely if tags is empty)
 
     Layout when with_link=False (no CTA, no link — just caption + tags):
 
         Caption line
         \n
-        #tag1 #tag2 #tag3 ...
+        #tag1 #tag2 #tag3 ...   (omitted entirely if tags is empty)
     """
     tb = TextBuilder()
 
@@ -371,7 +430,9 @@ def post_to_bluesky(media_name, local_path, kind, with_link):
     client = Client()
     client.login(handle, app_pw)
 
-    tags = pick_random_hashtags("hashtags.txt")
+    # Hashtag on/off is configurable separately per media kind.
+    hashtags_enabled = HASHTAGS_ENABLED_IMAGE if kind == "image" else HASHTAGS_ENABLED_VIDEO
+    tags = pick_random_hashtags("hashtags.txt") if hashtags_enabled else []
 
     if kind == "video":
         post_video_to_bluesky(client, media_name, local_path, tags, with_link)
@@ -381,7 +442,10 @@ def post_to_bluesky(media_name, local_path, kind, with_link):
     print(f"Posted {kind} to Bluesky (with_link={with_link}):")
     if with_link:
         print("  Link:", LINK_DISPLAY_TEXT)
-    print("  Tags:", " ".join(f"#{t}" for t in tags))
+    if tags:
+        print("  Tags:", " ".join(f"#{t}" for t in tags))
+    else:
+        print("  Tags: (hashtags disabled for this media kind)")
 
 
 def release_claim(file_id, original_name):
@@ -457,6 +521,7 @@ def main():
     fresh run that picks up right where this leaves off.
     """
     print_runner_ip_and_location()
+    print_config_summary()
     print(f"Starting loop. Posting every {LOOP_INTERVAL_SECONDS} seconds.")
     while True:
         cycle_start = time.time()
