@@ -48,19 +48,13 @@ jobs:
           python-version: "3.11"
       - name: Install dependencies
         run: pip install google-api-python-client google-auth-httplib2 google-auth-oauthlib atproto
-      - name: Verify token.pickle is present
-        run: |
-          if [ ! -s token.pickle ]; then
-            echo "::error::token.pickle not found in repo root (or it's empty). Make sure it's committed and not in .gitignore."
-            exit 1
-          fi
-          echo "token.pickle found ($(stat -c%s token.pickle) bytes)"
       - name: Run poster loop
         run: python -u post_bluesky.py
         env:
           PYTHONUNBUFFERED: "1"
           BSKY_HANDLE: ${{ vars.BSKY_HANDLE }}
           BSKY_APP_PW: ${{ secrets.BSKY_APP_PW }}
+          GOOGLE_OAUTH_CREDENTIALS: ${{ secrets.GOOGLE_OAUTH_CREDENTIALS }}
           UPLOAD_FOLDER_ID: ${{ secrets.UPLOAD_FOLDER_ID }}
           PROCESSED_FOLDER_ID: ${{ secrets.PROCESSED_FOLDER_ID }}
           # Content-mix knobs. workflow_dispatch inputs only exist when the
