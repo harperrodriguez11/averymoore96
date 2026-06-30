@@ -115,29 +115,48 @@ def get_creds():
     return creds
 
 
+def _try_ip_lookup(url, parse_fn, timeout=5):
+    req = urllib.request.Request(url, headers={"User-Agent": "curl/8.0"})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        data = json.loads(resp.read().decode())
+    return parse_fn(data)
+
+
 def print_runner_ip_and_location():
     """
     Print the GitHub Actions runner's public IP and rough geolocation.
 
     Purely informational — this helps confirm (e.g. when something looks
     off, or you're cross-checking against Bluesky's own login-activity
-    page) which network/region a given run actually executed from. Best
-    effort only: if the lookup fails (rate limit, network hiccup, the
-    `ip-api.com` endpoint not being on the runner's allowlist, etc.) we log
-    a warning and keep going rather than fail the whole job over it.
+    page) which network/region a given run actually executed from.
+
+    GitHub-hosted runner IPs get hit by every workflow on the planet, so a
+    single free geo-IP service can start 403/429-ing them during busy
+    periods (this is what was happening with ip-api.com). We try a small
+    chain of independent services and use whichever answers first; if all
+    of them fail we log a warning and keep going rather than fail the whole
+    job over a "nice to know" detail.
     """
-    try:
-        with urllib.request.urlopen("https://ip-api.com/json/", timeout=5) as resp:
-            data = json.loads(resp.read().decode())
-        ip = data.get("query", "unknown")
-        city = data.get("city", "unknown")
-        region = data.get("regionName", "unknown")
-        country = data.get("country", "unknown")
-        isp = data.get("isp", "unknown")
-        print(f"Runner public IP: {ip}")
-        print(f"Runner location: {city}, {region}, {country} (ISP: {isp})")
-    except Exception as e:
-        print(f"Warning: could not determine runner IP/location: {e}")
+    providers = [
+        ("ipinfo.io", "https://ipinfo.io/json",
+         lambda d: (d.get("ip", "unknown"),
+                    f"{d.get('city', 'unknown')}, {d.get('region', 'unknown')}, {d.get('country', 'unknown')} (org: {d.get('org', 'unknown')})")),
+        ("ifconfig.co", "https://ifconfig.co/json",
+         lambda d: (d.get("ip", "unknown"),
+                    f"{d.get('city', 'unknown')}, {d.get('region_name', 'unknown')}, {d.get('country', 'unknown')} (ASN: {d.get('asn_org', 'unknown')})")),
+        ("ip-api.com", "https://ip-api.com/json/",
+         lambda d: (d.get("query", "unknown"),
+                    f"{d.get('city', 'unknown')}, {d.get('regionName', 'unknown')}, {d.get('country', 'unknown')} (ISP: {d.get('isp', 'unknown')})")),
+    ]
+    for name, url, parse_fn in providers:
+        try:
+            ip, location = _try_ip_lookup(url, parse_fn)
+            print(f"Runner public IP: {ip}  [via {name}]")
+            print(f"Runner location: {location}")
+            return
+        except Exception as e:
+            print(f"Note: IP lookup via {name} failed ({e}); trying next provider...")
+    print("Warning: could not determine runner IP/location from any provider.")
 
 
 def print_target_account(handle):
@@ -146,10 +165,111 @@ def print_target_account(handle):
     so it's unambiguous at a glance (e.g. "@myaccount.bsky.social") which
     account is in play. Printed before login so it's the first thing visible
     in the job log — useful when multiple workflows/accounts share this same
-    script.
+    script. We only ever print the handle, never the app password — GitHub
+    auto-redacts secret values it recognizes, but we don't print it at all
+    on principle.
     """
     display_handle = handle if handle.startswith("@") else f"@{handle}"
     print(f"Target Bluesky account: {display_handle}")
+    print(f"  (app password loaded: {'yes' if get_env('BSKY_APP_PW', required=False) else 'NO — missing!'}, value not printed for security)")
+
+
+# ── Daily follower report (Google Sheet) ────────────────────────────────
+# One spreadsheet tracks every account's follower growth, one row per
+# account per calendar day (UTC). Re-runs on the same day for the same
+# handle are detected and skipped, so it doesn't matter how many times the
+# workflow restarts within a day — only the first run of the day for each
+# handle writes a row.
+FOLLOWER_SHEET_ID = "1d1ua2bzBt94omZxYgfwZhSJ94PJwAzc6clWpSVumebw"
+FOLLOWER_SHEET_TAB = "Sheet1"
+FOLLOWER_SHEET_RANGE = f"{FOLLOWER_SHEET_TAB}!A:E"
+FOLLOWER_SHEET_HEADER = ["Date (UTC)", "Handle", "Previous Followers", "Followers Added", "Total Followers"]
+
+
+def get_sheets_service():
+    """Reuse the same token.pickle creds already used for Drive — no separate
+    Google credential needed, as long as the token's scopes include Sheets
+    (https://www.googleapis.com/auth/spreadsheets, or a broad 'drive' scope
+    that also covers Sheets). If you get a 403 here, the token.pickle needs
+    to be regenerated with the Sheets scope added."""
+    creds = get_creds()
+    return build("sheets", "v4", credentials=creds)
+
+
+def ensure_follower_sheet_header(service):
+    """Write the header row if the sheet/tab is currently empty."""
+    result = service.spreadsheets().values().get(
+        spreadsheetId=FOLLOWER_SHEET_ID, range=f"{FOLLOWER_SHEET_TAB}!A1:E1"
+    ).execute()
+    if not result.get("values"):
+        service.spreadsheets().values().update(
+            spreadsheetId=FOLLOWER_SHEET_ID,
+            range=f"{FOLLOWER_SHEET_TAB}!A1:E1",
+            valueInputOption="RAW",
+            body={"values": [FOLLOWER_SHEET_HEADER]},
+        ).execute()
+        print("Initialized follower-report sheet header.")
+
+
+def get_last_follower_row(service, handle):
+    """Return the most recent [date, handle, previous, added, total] row for
+    this handle, or None if the handle has never been logged before."""
+    result = service.spreadsheets().values().get(
+        spreadsheetId=FOLLOWER_SHEET_ID, range=FOLLOWER_SHEET_RANGE
+    ).execute()
+    rows = result.get("values", [])
+    last_row = None
+    for row in rows[1:]:  # skip header
+        if len(row) >= 5 and row[1] == handle:
+            last_row = row
+    return last_row
+
+
+def append_follower_row(service, date_str, handle, previous, added, total):
+    service.spreadsheets().values().append(
+        spreadsheetId=FOLLOWER_SHEET_ID,
+        range=FOLLOWER_SHEET_RANGE,
+        valueInputOption="RAW",
+        insertDataOption="INSERT_ROWS",
+        body={"values": [[date_str, handle, previous, added, total]]},
+    ).execute()
+
+
+def maybe_generate_daily_follower_report(client, handle):
+    """
+    Once per UTC calendar day per handle: look up the account's current
+    follower count via the already-logged-in Bluesky client, compare it to
+    the last total we logged for this handle, and append one summary row to
+    the shared Google Sheet (previous total, followers gained, new total).
+
+    Safe to call on every cycle/run — it checks the sheet first and no-ops
+    if today's row for this handle already exists, so multiple workflow
+    restarts within the same day only ever produce one row per handle.
+    Designed to support multiple accounts/handles all appending to the same
+    sheet over time.
+    """
+    today_str = time.strftime("%Y-%m-%d", time.gmtime())
+    try:
+        service = get_sheets_service()
+        ensure_follower_sheet_header(service)
+
+        last_row = get_last_follower_row(service, handle)
+        if last_row and last_row[0] == today_str:
+            print(f"Follower report for {handle} already logged today ({today_str}); skipping.")
+            return
+
+        profile = client.get_profile(actor=handle)
+        total_followers = profile.followers_count or 0
+        previous_total = int(last_row[4]) if last_row else total_followers
+        added = total_followers - previous_total
+
+        append_follower_row(service, today_str, handle, previous_total, added, total_followers)
+        print(
+            f"Logged daily follower report for {handle}: "
+            f"previous={previous_total}, added={added:+d}, total={total_followers}"
+        )
+    except Exception as e:
+        print(f"Warning: could not generate/append daily follower report: {e}")
 
 
 def load_hashtag_sets(filepath="hashtags.txt"):
@@ -342,7 +462,7 @@ def move_file(file_id, restore_name=None):
 
 
 MAX_POST_LENGTH = 300  # Bluesky's grapheme limit per post
-LOOP_INTERVAL_SECONDS = 160  # 65 minutes between cycles (only used by main()'s loop mode)
+LOOP_INTERVAL_SECONDS = 3900  # 65 minutes between cycles (only used by main()'s loop mode)
 
 # ── Link definition ───────────────────────────────────────────────────────
 # Bluesky shows a "Leaving Bluesky" confirmation interstitial whenever the
@@ -423,13 +543,7 @@ def post_image_to_bluesky(client, image_name, local_path, tags, with_link):
     )
 
 
-def post_to_bluesky(media_name, local_path, kind, with_link):
-    handle = get_env("BSKY_HANDLE")
-    app_pw = get_env("BSKY_APP_PW")
-    print_target_account(handle)
-    client = Client()
-    client.login(handle, app_pw)
-
+def post_to_bluesky(client, media_name, local_path, kind, with_link):
     # Hashtag on/off is configurable separately per media kind.
     hashtags_enabled = HASHTAGS_ENABLED_IMAGE if kind == "image" else HASHTAGS_ENABLED_VIDEO
     tags = pick_random_hashtags("hashtags.txt") if hashtags_enabled else []
@@ -471,11 +585,23 @@ def run_once():
       1. image vs video, per IMAGE_RATIO/VIDEO_RATIO
       2. with-link vs no-link, per NO_LINK_RATIO
 
+    We log into Bluesky once at the top of the cycle (rather than inside the
+    posting step) so the account handle gets printed and the daily follower
+    report can run even on cycles where there's no new media to post.
+
     If the preferred media kind has no unclaimed files waiting, we fall back
     to the other kind rather than skipping the whole cycle — so an empty
     image folder doesn't stall posting when videos are available (and vice
     versa).
     """
+    handle = get_env("BSKY_HANDLE")
+    app_pw = get_env("BSKY_APP_PW")
+    print_target_account(handle)
+    client = Client()
+    client.login(handle, app_pw)
+
+    maybe_generate_daily_follower_report(client, handle)
+
     preferred_kind = choose_media_kind()
     fallback_kind = "video" if preferred_kind == "image" else "image"
 
@@ -492,7 +618,7 @@ def run_once():
     original_name = file.get("original_name", file["name"])
 
     try:
-        post_to_bluesky(original_name, local_path, kind, with_link)
+        post_to_bluesky(client, original_name, local_path, kind, with_link)
     except Exception:
         # Posting failed (e.g. transient API error) — give the file back so
         # it's eligible to be picked up and retried next cycle, rather than
