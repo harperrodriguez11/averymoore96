@@ -1,14 +1,36 @@
 name: Bluesky Auto Poster
-
 on:
   schedule:
     # Fires every 5h50m. With concurrency below, this acts as a restart
     # trigger: if the previous run is still alive it's a no-op; if GitHub
     # already killed the previous run at the 6-hour hard limit, this
-    # starts a fresh one. The script itself handles the 5-minute posting
-    # cadence internally via its own loop.
+    # starts a fresh one. The script itself handles the posting cadence
+    # internally via its own loop.
     - cron: "0,50 */5 * * *"
-  workflow_dispatch: {}   # manual trigger from the Actions tab
+  workflow_dispatch:       # manual trigger from the Actions tab, with knobs
+    inputs:
+      image_ratio:
+        description: "Image post share (e.g. 60 or 0.6) — auto-normalized against video_ratio"
+        required: false
+        default: "60"
+      video_ratio:
+        description: "Video post share (e.g. 40 or 0.4) — auto-normalized against image_ratio"
+        required: false
+        default: "40"
+      no_link_ratio:
+        description: "Chance a post skips the caption/CTA/link block (e.g. 20 or 0.2)"
+        required: false
+        default: "20"
+      hashtags_enabled_image:
+        description: "Attach hashtags to image posts?"
+        required: false
+        default: "true"
+        type: boolean
+      hashtags_enabled_video:
+        description: "Attach hashtags to video posts?"
+        required: false
+        default: "true"
+        type: boolean
 
 # Only one instance of the poster should ever be active at a time
 concurrency:
@@ -19,17 +41,13 @@ jobs:
   post:
     runs-on: ubuntu-latest
     timeout-minutes: 355   # just under GitHub's 360-minute hard cap per job
-
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/setup-python@v4
         with:
           python-version: "3.11"
-
       - name: Install dependencies
         run: pip install google-api-python-client google-auth-httplib2 google-auth-oauthlib atproto
-
       - name: Verify token.pickle is present
         run: |
           if [ ! -s token.pickle ]; then
@@ -37,7 +55,6 @@ jobs:
             exit 1
           fi
           echo "token.pickle found ($(stat -c%s token.pickle) bytes)"
-
       - name: Run poster loop
         run: python -u post_bluesky.py
         env:
@@ -46,3 +63,13 @@ jobs:
           BSKY_APP_PW: ${{ secrets.BSKY_APP_PW }}
           UPLOAD_FOLDER_ID: ${{ secrets.UPLOAD_FOLDER_ID }}
           PROCESSED_FOLDER_ID: ${{ secrets.PROCESSED_FOLDER_ID }}
+          # Content-mix knobs. workflow_dispatch inputs only exist when the
+          # run was triggered manually; on the scheduled trigger these are
+          # empty strings, and the script's own defaults (60/40/20, hashtags
+          # on) kick in. Override the defaults below if you want the
+          # *scheduled* runs to use different values too.
+          IMAGE_RATIO: ${{ github.event.inputs.image_ratio || '60' }}
+          VIDEO_RATIO: ${{ github.event.inputs.video_ratio || '40' }}
+          NO_LINK_RATIO: ${{ github.event.inputs.no_link_ratio || '20' }}
+          HASHTAGS_ENABLED_IMAGE: ${{ github.event.inputs.hashtags_enabled_image || 'true' }}
+          HASHTAGS_ENABLED_VIDEO: ${{ github.event.inputs.hashtags_enabled_video || 'true' }}
