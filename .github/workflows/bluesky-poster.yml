@@ -59,7 +59,7 @@ jobs:
         run: python -u post_bluesky.py
         env:
           PYTHONUNBUFFERED: "1"
-          BSKY_HANDLE: ${{ secrets.BSKY_HANDLE }}
+          BSKY_HANDLE: ${{ vars.BSKY_HANDLE }}
           BSKY_APP_PW: ${{ secrets.BSKY_APP_PW }}
           UPLOAD_FOLDER_ID: ${{ secrets.UPLOAD_FOLDER_ID }}
           PROCESSED_FOLDER_ID: ${{ secrets.PROCESSED_FOLDER_ID }}
