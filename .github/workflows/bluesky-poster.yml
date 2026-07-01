@@ -64,16 +64,14 @@ jobs:
           GOOGLE_OAUTH_CREDENTIALS: ${{ secrets.GOOGLE_OAUTH_CREDENTIALS }}
           UPLOAD_FOLDER_ID: ${{ secrets.UPLOAD_FOLDER_ID }}
           PROCESSED_FOLDER_ID: ${{ secrets.PROCESSED_FOLDER_ID }}
-          # ── Settings precedence: manual input > repo Variable > script default ──
-          # Setting these once as repo Variables (Settings → Secrets and
-          # variables → Actions → Variables) means BOTH the scheduled runs
-          # (4x/day, no inputs) and any manual run that doesn't override a
-          # field will keep using the same configured values automatically.
-          # Use workflow_dispatch inputs only when you want to override for
-          # one specific manual run.
-          CAPTION_SHEET_NAME: ${{ github.event.inputs.caption_sheet_name || vars.CAPTION_SHEET_NAME }}
+          # ── Settings: manual input > repo Variable > YOUR config below ──
+          # The values at the end of each line (after the last ||) are YOUR
+          # saved config — scheduled runs use these automatically.
+          # To change permanently: edit these values directly in this file.
+          # To override for just one run: use the workflow_dispatch inputs.
+          CAPTION_SHEET_NAME: ${{ github.event.inputs.caption_sheet_name || vars.CAPTION_SHEET_NAME || 'assian' }}
           IMAGE_RATIO: ${{ github.event.inputs.image_ratio || vars.IMAGE_RATIO || '60' }}
           VIDEO_RATIO: ${{ github.event.inputs.video_ratio || vars.VIDEO_RATIO || '40' }}
           NO_LINK_RATIO: ${{ github.event.inputs.no_link_ratio || vars.NO_LINK_RATIO || '20' }}
           HASHTAGS_ENABLED_IMAGE: ${{ github.event.inputs.hashtags_enabled_image || vars.HASHTAGS_ENABLED_IMAGE || 'true' }}
-          HASHTAGS_ENABLED_VIDEO: ${{ github.event.inputs.hashtags_enabled_video || vars.HASHTAGS_ENABLED_VIDEO || 'true' }}
+          HASHTAGS_ENABLED_VIDEO: ${{ github.event.inputs.hashtags_enabled_video || vars.HASHTAGS_ENABLED_VIDEO || 'false' }}
