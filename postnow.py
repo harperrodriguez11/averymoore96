@@ -212,24 +212,29 @@ def append_follower_row(service, date_str, handle, previous, added, total, statu
 
 class AccountTakenDownError(Exception):
     """Raised when Bluesky returns AccountTakedown for this handle.
-    Signals that the workflow should stop immediately — no point looping."""
+    Signals that the workflow should stop immediately and be disabled forever."""
 
 
-def log_account_ban_to_sheet(handle):
-    """Write a BANNED row to the follower report sheet so there's a clear
-    record of when the account was detected as taken down. Called before
-    exiting so the sheet always shows the last known status."""
+class NoMediaFoundError(Exception):
+    """Raised when Drive has no unclaimed image or video files this cycle.
+    Signals a clean exit (code 0) — the schedule should keep running so the
+    next trigger can check again once new files are uploaded."""
+
+
+def log_account_ban_to_sheet(handle, status="⛔ ACCOUNT TAKEN DOWN / BANNED"):
+    """Write a problem-status row to the follower report sheet so there's a
+    clear record of when and why this account stopped posting. Called before
+    exiting so the sheet always reflects the last known state."""
     today_str = time.strftime("%Y-%m-%d", time.gmtime())
     try:
         service = get_sheets_service()
         ensure_follower_sheet_header(service)
         last_row = get_last_follower_row(service, handle)
-        # Carry forward the last known total so the row is still useful.
         last_total = int(last_row[4]) if last_row and len(last_row) >= 5 else 0
         append_follower_row(
             service, today_str, handle,
             previous=last_total, added=0, total=last_total,
-            status="⛔ ACCOUNT TAKEN DOWN / BANNED",
+            status=status,
         )
         print(f"Logged account ban for {handle} to report sheet.")
     except Exception as e:
@@ -678,6 +683,11 @@ def run_once():
             raise AccountTakenDownError(
                 f"Account {handle} has been taken down / suspended."
             ) from e
+        if "AuthenticationRequired" in err_str or "Invalid identifier or password" in err_str:
+            raise AccountTakenDownError(
+                f"Authentication failed for {handle} — invalid handle or app password. "
+                "Fix BSKY_HANDLE / BSKY_APP_PW in repo secrets/variables, then re-enable the workflow."
+            ) from e
         raise
 
     maybe_generate_daily_follower_report(client, handle)
@@ -691,8 +701,10 @@ def run_once():
         file, local_path, kind = fetch_latest_media(fallback_kind)
 
     if not file:
-        print("No new media of either kind this cycle.")
-        return
+        raise NoMediaFoundError(
+            "No unclaimed image or video files found in Drive upload folder. "
+            "Exiting cleanly — will check again at the next scheduled run."
+        )
 
     with_link = random.random() >= NO_LINK_RATIO  # NO_LINK_RATIO chance of False
     original_name = file.get("original_name", file["name"])
@@ -733,16 +745,27 @@ def main():
         cycle_start = time.time()
         try:
             run_once()
+        except NoMediaFoundError as e:
+            print(f"\n{'='*60}")
+            print(f"NO MEDIA FOUND: {e}")
+            print("Stopping this run. Scheduled runs will continue as normal.")
+            print(f"{'='*60}\n")
+            # Exit 0 = success. The schedule keeps firing; the "disable workflow"
+            # step only triggers on failure(), so it won't run here.
+            sys.exit(0)
         except AccountTakenDownError as e:
             handle = get_env("BSKY_HANDLE", required=False) or "unknown"
+            err_str = str(e)
+            if "Authentication failed" in err_str or "app password" in err_str:
+                reason = "🔑 AUTH FAILED — wrong handle or app password"
+            else:
+                reason = "⛔ ACCOUNT TAKEN DOWN / BANNED"
             print(f"\n{'='*60}")
-            print(f"ACCOUNT TAKEN DOWN / BANNED: {e}")
-            print(f"Logging ban to report sheet and stopping workflow.")
+            print(err_str)
+            print(f"Logging to report sheet as: {reason}")
+            print("Stopping workflow.")
             print(f"{'='*60}\n")
-            log_account_ban_to_sheet(handle)
-            # Exit with a non-zero code so GitHub Actions marks the job as
-            # failed — this prevents the next scheduled trigger from re-running
-            # (GitHub stops retrying workflows that consistently fail).
+            log_account_ban_to_sheet(handle, status=reason)
             sys.exit(1)
         except Exception as e:
             print(f"Error during cycle: {e}")
