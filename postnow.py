@@ -103,6 +103,7 @@ def print_config_summary():
     print(f"  Hashtags on image posts: {HASHTAGS_ENABLED_IMAGE}")
     print(f"  Hashtags on video posts: {HASHTAGS_ENABLED_VIDEO}")
     print(f"  Caption category (sheet tab): {get_caption_sheet_tab_name()}")
+    print(f"  Post link: {LINK_DISPLAY_TEXT}")
     print("─────────────────────────────────────────────────")
 
 
@@ -549,8 +550,9 @@ LOOP_INTERVAL_SECONDS = 3900  # 65 minutes between cycles (only used by main()'s
 # To get a plain clickable link that opens directly with no warning, the
 # *displayed* text must be exactly the bare domain — same text Bluesky's own
 # UI would render for a link facet pointing at that domain.
-LINK_URL = "https://kr.teentoday.cfd"
-LINK_DISPLAY_TEXT = "kr.teentoday.cfd"
+_raw_link = get_env("POST_LINK_URL", required=False).strip().rstrip("/") or "https://kr.teentoday.cfd"
+LINK_URL = _raw_link if _raw_link.startswith("http") else f"https://{_raw_link}"
+LINK_DISPLAY_TEXT = LINK_URL.replace("https://", "").replace("http://", "")
 
 
 def build_post(tags: list[str], with_link: bool) -> TextBuilder:
