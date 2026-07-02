@@ -68,7 +68,7 @@ def get_bool_env(name, default=True):
     return raw.strip().lower() in ("1", "true", "yes", "on")
 
 
-# ── Content mix knobs ────────────────────────────────────────────────────
+# ── Content mix knobs ─────────────────────────────────────────────────────
 # What fraction of posts should be images vs. videos. Configurable via the
 # IMAGE_RATIO / VIDEO_RATIO env vars (plain fraction like "0.6" or a
 # percentage like "60"/"60%"). Whatever values are given get auto-normalized
@@ -95,15 +95,16 @@ MAX_IMAGE_BYTES = int(get_float_env("MAX_IMAGE_MB", 2) * 1024 * 1024)
 def print_config_summary():
     """Log the active content-mix knobs at startup so a glance at the job
     log confirms what this run is actually configured to do."""
-    print("── Content mix config ──────────────────────────")
+    print("── Content mix config ──────────────────────")
     print(f"  Image ratio:  {IMAGE_RATIO:.0%}")
     print(f"  Video ratio:  {VIDEO_RATIO:.0%}")
     print(f"  Hashtags on image posts: {HASHTAGS_ENABLED_IMAGE}")
     print(f"  Hashtags on video posts: {HASHTAGS_ENABLED_VIDEO}")
     print(f"  Post-plan sheet tab: {get_post_plan_sheet_tab_name()}")
     print(f"  Max image size before posting: {MAX_IMAGE_BYTES / (1024*1024):.1f} MB")
-    print(f"  Post link (used when a caption contains a URL): {LINK_DISPLAY_TEXT}")
-    print("─────────────────────────────────────────────────")
+    print(f"  Post link: {LINK_DISPLAY_TEXT}")
+    print(f"  Link-insert rate for no-link captions: {LINK_INSERT_RATIO:.0%}")
+    print("────────────────────────────────────────────")
 
 
 def get_creds():
@@ -590,44 +591,78 @@ _raw_link = get_env("POST_LINK_URL", required=False).strip().rstrip("/") or "htt
 LINK_URL = _raw_link if _raw_link.startswith("http") else f"https://{_raw_link}"
 LINK_DISPLAY_TEXT = LINK_URL.replace("https://", "").replace("http://", "")
 
-URL_IN_CAPTION_PATTERN = re.compile(r"https?://\S+")
+# Of captions that DON'T already contain a link, what fraction should still
+# get one added (old-pattern style: caption, blank line, bare clickable
+# domain). Configurable via LINK_INSERT_RATIO (plain fraction or percentage,
+# e.g. "20" or "0.2"). Captions that already contain a link always get their
+# link swapped for the real one — this ratio only applies to the no-link case.
+LINK_INSERT_RATIO = get_float_env("LINK_INSERT_RATIO", 0.20)
+
+# Matches a full URL (http/https) OR a bare domain-like string such as
+# "foodieposts.com" or "kr.teentoday.cfd" with no protocol, optionally
+# followed by a path. Requires a 2+ letter TLD so short abbreviations like
+# "e.g." or sentence-ending "no." don't accidentally match.
+LINK_PATTERN = re.compile(
+    r"(?:https?://)?(?:www\.)?[a-zA-Z0-9][a-zA-Z0-9-]*\.[a-zA-Z]{2,10}(?:/[^\s]*)?"
+)
 
 
 def build_post_from_caption(caption: str, tags: list[str]) -> TextBuilder:
     """
-    Build the post text from the sheet's caption. If the caption contains a
-    URL anywhere in it, that URL is swapped out for a clickable link facet
-    pointing at your real POST_LINK_URL (displayed as the bare domain, so it
-    opens directly with no "leaving site" warning) — everything else in the
-    caption is left exactly as written. If the caption has no URL, no link
-    is added at all.
+    Build the post text from the sheet's caption:
+
+    - If the caption already contains a link (full URL or bare domain like
+      "foodieposts.com"), that link is swapped out for a clickable link facet
+      pointing at your real POST_LINK_URL (displayed as the bare domain, so
+      it opens directly with no "leaving site" warning) — everything else in
+      the caption is left exactly as written.
 
         "Do you like garlic yes or no https://foodieposts.com/garlic"
           -> "Do you like garlic yes or no <kr.teentoday.cfd>" (clickable)
 
+    - If the caption has NO link at all, LINK_INSERT_RATIO of the time
+      (default 20%) your real link gets appended on its own line below the
+      caption anyway, same clickable pattern. The rest of the time, no link
+      is added.
+
     Hashtags (if any) are appended on their own line at the end.
     """
     tb = TextBuilder()
+    added_content = False
 
-    match = URL_IN_CAPTION_PATTERN.search(caption) if caption else None
-    if match:
-        before = caption[: match.start()]
-        after = caption[match.end():]
-        if before:
-            tb.text(before)
+    def add_separator():
+        if added_content:
+            tb.text("\n\n")
+
+    match = LINK_PATTERN.search(caption) if caption else None
+
+    if caption:
+        add_separator()
+        if match:
+            before = caption[: match.start()]
+            after = caption[match.end():]
+            if before:
+                tb.text(before)
+            tb.link(LINK_DISPLAY_TEXT, LINK_URL)
+            if after.strip():
+                tb.text(after)
+        else:
+            tb.text(caption)
+        added_content = True
+
+    if not match and random.random() < LINK_INSERT_RATIO:
+        add_separator()
         tb.link(LINK_DISPLAY_TEXT, LINK_URL)
-        if after.strip():
-            tb.text(after)
-    elif caption:
-        tb.text(caption)
+        added_content = True
+        print(f"  Caption had no link — added one anyway (LINK_INSERT_RATIO={LINK_INSERT_RATIO:.0%}).")
 
     if tags:
-        if caption:
-            tb.text("\n\n")
+        add_separator()
         for i, tag in enumerate(tags):
             tb.tag(f"#{tag}", tag)
             if i < len(tags) - 1:
                 tb.text(" ")
+        added_content = True
 
     return tb
 
@@ -685,8 +720,9 @@ def run_once():
 
     Each cycle rolls image vs video (per IMAGE_RATIO/VIDEO_RATIO), then picks
     the newest unclaimed Drive file of that kind that also has a matching row
-    in the post-plan sheet, using that row's caption as-is (with any URL in
-    it swapped for your real link).
+    in the post-plan sheet (and isn't already marked posted), using that
+    row's caption as-is (with any link in it swapped for your real link, or
+    LINK_INSERT_RATIO chance of adding one if the caption has none).
     """
     handle = get_env("BSKY_HANDLE")
     app_pw = get_env("BSKY_APP_PW")
