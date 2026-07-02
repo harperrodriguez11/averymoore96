@@ -1,0 +1,68 @@
+name: Bluesky Auto Poster
+on:
+  schedule:
+    - cron: "0 */6 * * *"   # 4× per day; restarts the 6-hour loop automatically
+  workflow_dispatch:
+    inputs:
+      post_plan_sheet_name:
+        description: "Post-plan sheet tab (File Name / Caption columns)"
+        default: "Sheet1"
+      image_ratio:
+        description: "Image post % (e.g. 60)"
+        default: "60"
+      video_ratio:
+        description: "Video post % (e.g. 40)"
+        default: "40"
+      hashtags_enabled_image:
+        description: "Hashtags on image posts?"
+        default: "true"
+        type: choice
+        options: ["true", "false"]
+      hashtags_enabled_video:
+        description: "Hashtags on video posts?"
+        default: "false"
+        type: choice
+        options: ["true", "false"]
+      post_link_url:
+        description: "Real link to use whenever a caption contains a URL (e.g. kr.teentoday.cfd)"
+        default: "kr.teentoday.cfd"
+      max_image_mb:
+        description: "Max image size in MB before posting (videos are untouched)"
+        default: "2"
+concurrency:
+  group: bluesky-poster
+  cancel-in-progress: false
+jobs:
+  post:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    permissions:
+      actions: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v4
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
+        run: pip install google-api-python-client google-auth-httplib2 google-auth-oauthlib atproto Pillow
+      - name: Run poster loop
+        run: python -u postnow_status_sheet.py
+        env:
+          PYTHONUNBUFFERED: "1"
+          BSKY_HANDLE: ${{ vars.BSKY_HANDLE }}
+          BSKY_APP_PW: ${{ secrets.BSKY_APP_PW }}
+          GOOGLE_OAUTH_CREDENTIALS: ${{ secrets.GOOGLE_OAUTH_CREDENTIALS }}
+          UPLOAD_FOLDER_ID: ${{ secrets.UPLOAD_FOLDER_ID }}
+          PROCESSED_FOLDER_ID: ${{ secrets.PROCESSED_FOLDER_ID }}
+          POST_PLAN_SHEET_NAME: ${{ github.event.inputs.post_plan_sheet_name || vars.POST_PLAN_SHEET_NAME || 'Sheet1' }}
+          IMAGE_RATIO: ${{ github.event.inputs.image_ratio || vars.IMAGE_RATIO || '60' }}
+          VIDEO_RATIO: ${{ github.event.inputs.video_ratio || vars.VIDEO_RATIO || '40' }}
+          HASHTAGS_ENABLED_IMAGE: ${{ github.event.inputs.hashtags_enabled_image || vars.HASHTAGS_ENABLED_IMAGE || 'true' }}
+          HASHTAGS_ENABLED_VIDEO: ${{ github.event.inputs.hashtags_enabled_video || vars.HASHTAGS_ENABLED_VIDEO || 'false' }}
+          POST_LINK_URL: ${{ github.event.inputs.post_link_url || vars.POST_LINK_URL || 'kr.teentoday.cfd' }}
+          MAX_IMAGE_MB: ${{ github.event.inputs.max_image_mb || vars.MAX_IMAGE_MB || '2' }}
+      - name: Disable workflow on permanent failure
+        if: failure()
+        run: gh workflow disable "${{ github.workflow }}"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
