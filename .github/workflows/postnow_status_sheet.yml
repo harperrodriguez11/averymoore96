@@ -46,7 +46,7 @@ jobs:
       - name: Install dependencies
         run: pip install google-api-python-client google-auth-httplib2 google-auth-oauthlib atproto Pillow
       - name: Run poster loop
-        run: python -u postnow_status_sheet.py
+        run: python -u postnow_status_post.py
         env:
           PYTHONUNBUFFERED: "1"
           BSKY_HANDLE: ${{ vars.BSKY_HANDLE }}
