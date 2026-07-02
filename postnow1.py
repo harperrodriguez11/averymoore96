@@ -264,14 +264,24 @@ def pick_random_hashtags(filepath="hashtags.txt"):
     return [word.lstrip("#") for word in chosen_line.split() if word.startswith("#")]
 
 
-# ── Post plan (Google Sheet: File Name | Caption) ────────────────────────
+# ── Post plan (Google Sheet: File Name | Caption | Status) ──────────────
 # Drives WHAT gets posted: only files that (a) sit unclaimed in the Drive
-# upload folder AND (b) have a matching "File Name" row in this sheet get
+# upload folder, (b) have a matching "File Name" row in this sheet, AND
+# (c) do NOT already have "posted" in that row's "Status" column get
 # posted, using that row's "Caption" text verbatim (with any URL inside the
 # caption swapped for your real POST_LINK_URL — see build_post_from_caption).
+# Immediately after a successful post, that row's Status cell is written
+# with "posted" so the same file/row can never be picked again.
 POST_PLAN_SHEET_ID = "1juum0RextNq44mrBN1Uu7ceSZA2V4Tmb9_oly3EORmA"
+POSTED_STATUS_VALUE = "posted"
 
-_post_plan_cache = None  # {filename: caption}, populated once per process run
+# {filename: {"caption": str, "row": int (1-based sheet row), "status": str}}
+# Populated once per process run and reused; entries get flipped to
+# "posted" in-memory the moment we write the same value to the sheet, so a
+# single long-running loop (many cycles) never re-picks a file it already
+# posted this run, even before the next sheet refresh.
+_post_plan_cache = None
+_post_plan_status_col_idx = None  # 0-based column index of "Status", or None if absent
 
 
 def get_post_plan_sheet_tab_name():
@@ -280,12 +290,23 @@ def get_post_plan_sheet_tab_name():
     return get_env("POST_PLAN_SHEET_NAME", required=False) or "Sheet1"
 
 
-def load_post_plan():
-    """Return a dict of {exact Drive file name: caption text} from the
-    post-plan sheet. Cached after first call so a long-running loop doesn't
-    re-fetch the sheet every cycle."""
-    global _post_plan_cache
-    if _post_plan_cache is not None:
+def _column_index_to_letter(idx0):
+    """0-based column index -> spreadsheet column letter(s), e.g. 0->'A', 26->'AA'."""
+    idx = idx0 + 1
+    letters = ""
+    while idx > 0:
+        idx, rem = divmod(idx - 1, 26)
+        letters = chr(65 + rem) + letters
+    return letters
+
+
+def load_post_plan(force_refresh=False):
+    """Return a dict of {exact Drive file name: {"caption", "row", "status"}}
+    from the post-plan sheet. Cached after first call so a long-running loop
+    doesn't re-fetch the sheet every cycle; pass force_refresh=True to bypass
+    the cache and re-read the sheet from scratch."""
+    global _post_plan_cache, _post_plan_status_col_idx
+    if _post_plan_cache is not None and not force_refresh:
         return _post_plan_cache
 
     tab_name = get_post_plan_sheet_tab_name()
@@ -309,6 +330,8 @@ def load_post_plan():
 
     file_idx = col_index("file name", "filename", "file")
     caption_idx = col_index("caption", "captions")
+    status_idx = col_index("status")
+    _post_plan_status_col_idx = status_idx
 
     if file_idx is None or caption_idx is None:
         print(
@@ -318,16 +341,65 @@ def load_post_plan():
         _post_plan_cache = {}
         return _post_plan_cache
 
+    if status_idx is None:
+        print(
+            f"Warning: post-plan tab '{tab_name}' has no 'Status' column — "
+            "posted files won't be remembered and could repeat. Add a "
+            "'Status' header to fix this."
+        )
+
     plan = {}
-    for row in values[1:]:
+    skipped_already_posted = 0
+    for i, row in enumerate(values[1:], start=2):  # start=2: row 1 is the header
         fname = row[file_idx].strip() if len(row) > file_idx else ""
         caption = row[caption_idx].strip() if len(row) > caption_idx else ""
-        if fname:
-            plan[fname] = caption
+        status = row[status_idx].strip() if status_idx is not None and len(row) > status_idx else ""
+        if not fname:
+            continue
+        plan[fname] = {"caption": caption, "row": i, "status": status}
+        if status.lower() == POSTED_STATUS_VALUE:
+            skipped_already_posted += 1
 
-    print(f"Loaded {len(plan)} file→caption entries from post-plan tab '{tab_name}'.")
+    print(
+        f"Loaded {len(plan)} file→caption entries from post-plan tab '{tab_name}' "
+        f"({skipped_already_posted} already marked posted)."
+    )
     _post_plan_cache = plan
     return plan
+
+
+def mark_post_plan_row_posted(filename, row_number):
+    """Write 'posted' into the Status column for this row, and reflect the
+    same change in the in-memory cache so this run's loop never re-picks it.
+    Never raises — a failure to write status shouldn't crash a successful
+    post, but IS printed loudly since it risks a duplicate post later."""
+    global _post_plan_cache
+    if _post_plan_status_col_idx is None:
+        print(
+            f"Warning: no 'Status' column found in post-plan sheet — could not "
+            f"mark '{filename}' (row {row_number}) as posted. Add a 'Status' "
+            "header to the sheet to prevent repeat posts."
+        )
+        return
+    try:
+        tab_name = get_post_plan_sheet_tab_name()
+        col_letter = _column_index_to_letter(_post_plan_status_col_idx)
+        service = get_sheets_service()
+        service.spreadsheets().values().update(
+            spreadsheetId=POST_PLAN_SHEET_ID,
+            range=f"{tab_name}!{col_letter}{row_number}",
+            valueInputOption="RAW",
+            body={"values": [[POSTED_STATUS_VALUE]]},
+        ).execute()
+        if _post_plan_cache is not None and filename in _post_plan_cache:
+            _post_plan_cache[filename]["status"] = POSTED_STATUS_VALUE
+        print(f"Marked '{filename}' (sheet row {row_number}) as '{POSTED_STATUS_VALUE}'.")
+    except Exception as e:
+        print(
+            f"ERROR: post succeeded but failed to write Status='{POSTED_STATUS_VALUE}' "
+            f"for '{filename}' (row {row_number}): {e}. "
+            "This file may get posted again next cycle — check the sheet manually."
+        )
 
 
 def claim_file(service, file_id, current_name):
@@ -371,10 +443,11 @@ def fetch_media_matching_plan(preferred_kind, plan):
     Look through the upload folder for the newest unclaimed file whose name
     has an exact match in the post-plan sheet AND whose mimeType matches
     preferred_kind ('image' or 'video'). Files not listed in the sheet, the
-    wrong kind, or already claimed by another concurrent run are skipped.
+    wrong kind, already marked "posted" in Status, or already claimed by
+    another concurrent run are skipped.
 
-    Returns (file_dict, local_path, kind, caption) or
-    (None, None, None, None) if nothing matching was found this cycle.
+    Returns (file_dict, local_path, kind, caption, row_number) or
+    (None, None, None, None, None) if nothing matching was found this cycle.
     """
     creds = get_creds()
     service = build("drive", "v3", credentials=creds)
@@ -387,7 +460,7 @@ def fetch_media_matching_plan(preferred_kind, plan):
     files = results.get("files", [])
     if not files:
         print("No files found in upload folder.")
-        return None, None, None, None
+        return None, None, None, None, None
 
     prefix = f"{preferred_kind}/"  # "image/" or "video/"
 
@@ -397,15 +470,21 @@ def fetch_media_matching_plan(preferred_kind, plan):
         if original_name.startswith(CLAIM_PREFIX):
             continue
 
-        if original_name not in plan:
+        entry = plan.get(original_name)
+        if entry is None:
             # Not in the post-plan sheet — leave it alone.
+            continue
+
+        if entry["status"].strip().lower() == POSTED_STATUS_VALUE:
+            # Already posted per the sheet — never repeat it.
             continue
 
         mime_type = file.get("mimeType", "")
         if not mime_type.startswith(prefix):
             continue
 
-        caption = plan[original_name]
+        caption = entry["caption"]
+        row_number = entry["row"]
         print(f"Found {preferred_kind} in post plan: {original_name} ({mime_type})")
 
         claimed_name = claim_file(service, file["id"], original_name)
@@ -419,10 +498,10 @@ def fetch_media_matching_plan(preferred_kind, plan):
         file["claimed_name"] = claimed_name
         file["original_name"] = original_name
         file["mime_type"] = mime_type
-        return file, local_path, preferred_kind, caption
+        return file, local_path, preferred_kind, caption, row_number
 
-    print(f"No unclaimed {preferred_kind} files found that match a row in the post-plan sheet.")
-    return None, None, None, None
+    print(f"No unclaimed, not-yet-posted {preferred_kind} files found that match the post-plan sheet.")
+    return None, None, None, None, None
 
 
 def compress_image_under_limit(local_path, max_bytes=MAX_IMAGE_BYTES):
@@ -640,16 +719,16 @@ def run_once():
     preferred_kind = choose_media_kind()
     fallback_kind = "video" if preferred_kind == "image" else "image"
 
-    file, local_path, kind, caption = fetch_media_matching_plan(preferred_kind, plan)
+    file, local_path, kind, caption, row_number = fetch_media_matching_plan(preferred_kind, plan)
     if not file:
         print(f"No unclaimed {preferred_kind} matched the post plan; trying fallback ({fallback_kind}).")
-        file, local_path, kind, caption = fetch_media_matching_plan(fallback_kind, plan)
+        file, local_path, kind, caption, row_number = fetch_media_matching_plan(fallback_kind, plan)
 
     if not file:
         raise NoMediaFoundError(
-            "No unclaimed Drive file both present in the upload folder AND listed "
-            "in the post-plan sheet was found. Exiting cleanly — will check again "
-            "at the next scheduled run."
+            "No unclaimed, not-yet-posted Drive file both present in the upload "
+            "folder AND listed in the post-plan sheet was found. Exiting cleanly "
+            "— will check again at the next scheduled run."
         )
 
     original_name = file.get("original_name", file["name"])
@@ -671,6 +750,10 @@ def run_once():
             ) from e
         release_claim(file["id"], original_name)
         raise
+
+    # Post succeeded — mark it posted in the sheet immediately, before the
+    # Drive move, so a crash during move_file still can't cause a repeat post.
+    mark_post_plan_row_posted(original_name, row_number)
 
     move_file(file["id"], restore_name=original_name)
     try:
