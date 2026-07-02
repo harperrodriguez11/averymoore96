@@ -26,6 +26,9 @@ on:
       post_link_url:
         description: "Real link to use whenever a caption contains a URL (e.g. kr.teentoday.cfd)"
         default: "kr.teentoday.cfd"
+      link_insert_ratio:
+        description: "% of NO-link captions that still get the link added anyway"
+        default: "20"
       max_image_mb:
         description: "Max image size in MB before posting (videos are untouched)"
         default: "2"
@@ -46,7 +49,7 @@ jobs:
       - name: Install dependencies
         run: pip install google-api-python-client google-auth-httplib2 google-auth-oauthlib atproto Pillow
       - name: Run poster loop
-        run: python -u postnow1.py
+        run: python -u postnow.py
         env:
           PYTHONUNBUFFERED: "1"
           BSKY_HANDLE: ${{ vars.BSKY_HANDLE }}
@@ -60,6 +63,7 @@ jobs:
           HASHTAGS_ENABLED_IMAGE: ${{ github.event.inputs.hashtags_enabled_image || vars.HASHTAGS_ENABLED_IMAGE || 'true' }}
           HASHTAGS_ENABLED_VIDEO: ${{ github.event.inputs.hashtags_enabled_video || vars.HASHTAGS_ENABLED_VIDEO || 'false' }}
           POST_LINK_URL: ${{ github.event.inputs.post_link_url || vars.POST_LINK_URL || 'kr.teentoday.cfd' }}
+          LINK_INSERT_RATIO: ${{ github.event.inputs.link_insert_ratio || vars.LINK_INSERT_RATIO || '20' }}
           MAX_IMAGE_MB: ${{ github.event.inputs.max_image_mb || vars.MAX_IMAGE_MB || '2' }}
       - name: Disable workflow on permanent failure
         if: failure()
