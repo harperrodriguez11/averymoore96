@@ -2,6 +2,7 @@ import csv
 import json
 import os
 import random
+import re
 import socket
 import sys
 import time
@@ -421,56 +422,68 @@ def pick_random_caption_only():
     return caption
 
 
-# ── Filename → Caption mapping (Google Sheet tab) ────────────────────────
-# When CAPTION_MODE=filename the script looks up the media file's name in a
-# sheet tab (FILENAME_MAP_TAB, default "FileMap") with two columns:
-#
-#   File Name               | Caption              | link_action_caption (optional)
-#   healthy_recipes.mp4     | We are making ...    | Click to see more
-#
-# Matching is tried in this order:
-#   1. Exact filename  (healthy_recipes.mp4)
-#   2. Name without extension  (healthy_recipes)
-# If no match, falls back to a random caption from the normal caption tab.
-FILENAME_MAP_HEADER = ["file name", "caption", "link_action_caption"]
+# ── Filename → Caption mapping (dedicated Google Sheet) ─────────────────
+# Sheet: https://docs.google.com/spreadsheets/d/12KXL16nrcpsPXCrtycvt9it-irK4vPjJQm4anAILNFk
+# Columns read: "File Name" (A) and "Caption" (B).
+# "Tweet URL" (C) and "Type" (D) are ignored — they're source metadata only.
+# Any URL found in a caption (https://t.co/... or any https?:// link) is
+# automatically replaced with the POST_LINK_URL configured for this run, so
+# the original source links never appear in the final Bluesky post.
+FILENAME_MAP_SHEET_ID = "12KXL16nrcpsPXCrtycvt9it-irK4vPjJQm4anAILNFk"
+FILENAME_MAP_HEADER   = ["File Name", "Caption"]   # used only when creating a new tab
+
+_URL_RE = re.compile(r"https?://\S+")
+
+
+def replace_links(text):
+    """Replace every URL (https?://...) in text with the active POST_LINK_URL.
+    Applied to all captions from every source so no original t.co / external
+    link ever leaks into a posted caption."""
+    if not text:
+        return text
+    return _URL_RE.sub(LINK_URL, text).strip()
 
 
 def get_filename_map_tab_name():
-    return get_env("FILENAME_MAP_TAB", required=False) or "FileMap"
+    """Tab inside the filename-map spreadsheet. Defaults to 'Sheet1' (the
+    existing tab) — override via FILENAME_MAP_TAB env var if needed."""
+    return get_env("FILENAME_MAP_TAB", required=False) or "Sheet1"
 
 
 def ensure_filename_map_tab_exists(service, tab_name):
-    metadata = service.spreadsheets().get(spreadsheetId=CAPTIONS_SHEET_ID).execute()
+    """Create the tab with a header row only if it doesn't already exist."""
+    metadata = service.spreadsheets().get(spreadsheetId=FILENAME_MAP_SHEET_ID).execute()
     existing = [s["properties"]["title"] for s in metadata.get("sheets", [])]
     if tab_name in existing:
         return
     print(f"Filename-map tab '{tab_name}' doesn't exist — creating it.")
     service.spreadsheets().batchUpdate(
-        spreadsheetId=CAPTIONS_SHEET_ID,
+        spreadsheetId=FILENAME_MAP_SHEET_ID,
         body={"requests": [{"addSheet": {"properties": {"title": tab_name}}}]},
     ).execute()
     service.spreadsheets().values().update(
-        spreadsheetId=CAPTIONS_SHEET_ID,
-        range=f"{tab_name}!A1:C1",
+        spreadsheetId=FILENAME_MAP_SHEET_ID,
+        range=f"{tab_name}!A1:B1",
         valueInputOption="RAW",
         body={"values": [FILENAME_MAP_HEADER]},
     ).execute()
-    print(f"Created filename-map tab '{tab_name}'. Add your File Name / Caption rows.")
+    print(f"Created filename-map tab '{tab_name}'. Add File Name / Caption rows.")
 
 
 def load_filename_map():
-    """Return a dict of {normalised_key: (caption, cta)} from the FileMap tab.
-    Keys are stored both with and without extension so either lookup hits."""
+    """Return {normalised_key: caption} from the filename-map sheet.
+    Keys are stored both with and without extension so either lookup hits.
+    All URLs in captions are replaced with LINK_URL on load."""
     global _filename_map_cache
     if _filename_map_cache is not None:
         return _filename_map_cache
 
     tab_name = get_filename_map_tab_name()
-    service = get_sheets_service()
+    service  = get_sheets_service()
     ensure_filename_map_tab_exists(service, tab_name)
 
     result = service.spreadsheets().values().get(
-        spreadsheetId=CAPTIONS_SHEET_ID, range=f"{tab_name}!A:Z"
+        spreadsheetId=FILENAME_MAP_SHEET_ID, range=f"{tab_name}!A:D"
     ).execute()
     values = result.get("values", [])
     if len(values) < 2:
@@ -480,60 +493,62 @@ def load_filename_map():
 
     header = [h.strip().lower() for h in values[0]]
 
-    def col(name, *fallbacks):
-        for n in (name, *fallbacks):
+    def col(*names):
+        for n in names:
             if n in header:
                 return header.index(n)
         return None
 
     fn_idx  = col("file name", "filename", "file_name")
     cap_idx = col("caption", "captions")
-    cta_idx = col("link_action_caption", "lik_action_caption", "cta")
 
     if fn_idx is None or cap_idx is None:
-        print(f"Warning: filename-map tab '{tab_name}' must have 'File Name' and 'Caption' columns.")
+        print(f"Warning: filename-map sheet header {header} needs 'File Name' and 'Caption' columns.")
         _filename_map_cache = {}
         return _filename_map_cache
 
     mapping = {}
     for row in values[1:]:
         filename = row[fn_idx].strip() if len(row) > fn_idx else ""
-        caption  = row[cap_idx].strip() if len(row) > cap_idx else ""
-        cta      = row[cta_idx].strip() if (cta_idx is not None and len(row) > cta_idx) else ""
+        raw_cap  = row[cap_idx].strip() if len(row) > cap_idx else ""
+        caption  = replace_links(raw_cap)   # swap t.co / any URL → LINK_URL
         if filename and caption:
             key_full = filename.lower()
             key_bare = os.path.splitext(key_full)[0]
-            mapping[key_full] = (caption, cta)
-            mapping[key_bare] = (caption, cta)
+            mapping[key_full] = caption
+            mapping[key_bare] = caption
 
-    print(f"Loaded {len(values)-1} filename-caption mappings from tab '{tab_name}'.")
+    print(f"Loaded {len(values)-1} filename→caption rows (URLs replaced with {LINK_DISPLAY_TEXT}).")
     _filename_map_cache = mapping
     return _filename_map_cache
 
 
 def get_caption_for_file(media_name, with_link):
-    """Return (caption, cta) for the given media file using the active mode.
+    """Return (caption, cta) using the active caption mode.
 
-    random  → pick any row from the caption tab (ignores media_name)
-    filename → look up media_name in the FileMap tab; fall back to random
-               if no match found.
+    filename → look up media_name in the filename-map sheet (URLs already
+               replaced). Caption is self-contained; no separate CTA block
+               is added so the link isn't duplicated.
+    random   → pick a random row from the caption tab (URLs replaced too).
+               CTA block is added when with_link=True.
+    Falls back to random if filename mode finds no match.
     """
     if CAPTION_MODE == "filename":
-        mapping = load_filename_map()
+        mapping  = load_filename_map()
         key_full = media_name.lower()
         key_bare = os.path.splitext(key_full)[0]
-        pair = mapping.get(key_full) or mapping.get(key_bare)
-        if pair:
-            caption, cta = pair
-            print(f"  Caption mode: filename match for '{media_name}'")
-            return caption, cta if with_link else caption, ""
-        else:
-            print(f"  Caption mode: no filename match for '{media_name}', falling back to random.")
+        caption  = mapping.get(key_full) or mapping.get(key_bare)
+        if caption:
+            print(f"  Caption: filename match for '{media_name}' (link replaced)")
+            # Caption already contains LINK_URL inline — no separate CTA block
+            return caption, ""
+        print(f"  Caption: no match for '{media_name}', falling back to random.")
 
     # random mode (or filename fallback)
     if with_link:
-        return pick_random_caption_and_cta()
-    return pick_random_caption_only(), ""
+        cap, cta = pick_random_caption_and_cta()
+        return replace_links(cap), replace_links(cta)
+    return replace_links(pick_random_caption_only()), ""
 
 
 def claim_file(service, file_id, current_name):
